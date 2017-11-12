@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+import sys, os, re, sqlite3, argparse
+
+re_value = re.compile(r'''^([A-Za-z0-9_]+)=(.*)$''')
+re_notset = re.compile(r'''^# ([A-Za-z0-9_]+) is not set\s*$''')
+
+def parse_config(fn):
+  d = {}
+  for L in open(fn, 'r'):
+    L = L.strip(' \r\n\t')
+    if L == '':
+      continue
+    m = re_notset.match(L)
+    if m:
+      name = m.groups()[0]
+      d[name] = None
+    elif L[0] == '#':
+      continue
+    else:
+      m = re_value.match(L)
+      if m:
+        k, v = m.groups()
+        d[k] = v
+      else:
+        raise Exception('??? %s' % repr(L))
+  return d
+
+recorded_settings = {}
+def record_config(db, name, cfg):
+  cur = db.cursor()
+  cur.execute('SELECT name FROM config WHERE name=? LIMIT 1', [name])
+  if cur.fetchone():
+    # Config already inserted.
+    return
+
+  cur.execute('INSERT INTO config (name) VALUES (?)', [name])
+
+  for k, v in cfg.items():
+    if k in recorded_settings:
+      continue
+    cur.execute('SELECT name FROM setting WHERE name=? LIMIT 1', [k])
+    if not cur.fetchone():
+      cur.execute('INSERT INTO setting (name) VALUES (?)', [k])
+    recorded_settings[k] = dict(tristate=True)
+
+  for k, v in cfg.items():
+    if v is not None and v != 'm' and v is not 'y' and v is not 'n':
+      recorded_settings[k]['tristate'] = False
+
+    cur.execute('INSERT INTO config_setting (config_name, setting_name, value) VALUES (?,?,?)', [name, k, v])
+
+  for k, v in recorded_settings.items():
+    if not v['tristate']:
+      cur.execute('UPDATE setting SET is_tristate=0 WHERE name=?', [k])
+
+  db.commit()
+  return
+
+def run():
+  ap = argparse.ArgumentParser()
+  ap.add_argument('db-file')
+  ap.add_argument('configs-dir')
+  args = vars(ap.parse_args())
+
+  dbFile = args['db-file']
+  db = sqlite3.connect(dbFile)
+
+  cur = db.cursor()
+  cur.executescript('''
+    CREATE TABLE IF NOT EXISTS config (
+      name text NOT NULL PRIMARY KEY
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_config__name ON config (name);
+
+    CREATE TABLE IF NOT EXISTS setting (
+      name text NOT NULL PRIMARY KEY,
+      is_tristate BOOLEAN NOT NULL DEFAULT 1
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_setting__name ON setting (name);
+
+    CREATE TABLE IF NOT EXISTS config_setting (
+      config_name text NOT NULL,
+      setting_name text NOT NULL,
+      value text,
+      FOREIGN KEY (config_name) REFERENCES config (name),
+      FOREIGN KEY (setting_name) REFERENCES setting (name)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_config_setting__config_name__setting_name ON config_setting (config_name, setting_name);
+    CREATE INDEX IF NOT EXISTS idx_config_setting__config_name ON config_setting (config_name);
+    CREATE INDEX IF NOT EXISTS idx_config_setting__setting_name ON config_setting (setting_name);
+  ''')
+  db.commit()
+
+  configsDir = args['configs-dir']
+  for _1, _2, items in os.walk(configsDir):
+    for item in items:
+      d = parse_config(os.path.join(configsDir, item))
+      record_config(db, item, d)
+
+  return 0
+
+if __name__ == '__main__':
+  sys.exit(run())

@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+import sys, os, sqlite3, cgi, argparse
+
+def pct(n):
+  return '%.1f%%' % (n*100)
+
+def write_file(outDir, name, d, ext='.xhtml'):
+  with open(os.path.join(outDir, name+ext), 'w') as f:
+    f.write(d)
+
+def write_xhtml(outDir, name, d, title='', subd=0):
+  title_ = 'Linux Kernel Configuration Report'
+  if title != '':
+    title_ = title + ' — ' + title_
+
+  subdp = '../'*subd
+
+  write_file(outDir, name, '''<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en" class="nojs">
+  <head>
+    <meta http-equiv="Content-Type" content="application/xhtml+xml; charset=utf-8"/>
+    <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
+    <title>'''+cgi.escape(title_)+'''</title>
+    <style><![CDATA[
+      table { width: 100%; }
+      th { background-color: #dadada; border-bottom: solid 1px #333; text-align: left; }
+      th.flags { text-align: center; }
+      tr:nth-child(odd) td { background-color: #e0e0e0; }
+      .option-table .option-name a:link,
+      .config-table .config-name a:link { color: inherit; text-decoration: none; }
+      .option-table .option-flags { text-align: center; }
+      .option-table .option-pct { text-align: right; }
+      .config-table .config-name { font-family: monospace; }
+      nav { background-color: #d0d0d0; padding: 0.1em; }
+    ]]></style>
+  </head>
+  <body>
+    <h1>The Linux Kernel Configuration Report</h1>
+    <nav><ul>
+      <li><a href="{DIR}.">About</a></li>
+      <li><a href="{DIR}tristate_enabled.xhtml">Boolean and tristate options (sorted by enablement)</a></li>
+      <li><a href="{DIR}tristate_understood.xhtml">Boolean and tristate options (sorted by understanding)</a></li>
+      <li><a href="{DIR}value_name.xhtml">Non-boolean/tristate options (sorted by name)</a></li>
+      <li><a href="{DIR}options_understood.xhtml">All options (sorted by understanding)</a></li>
+      <li><a href="{DIR}options_name.xhtml">All options (sorted by name)</a></li>
+      <li><a href="{DIR}configlist.xhtml">List of configurations used to generate this list</a></li>
+    </ul></nav>
+    <main>
+'''.replace('{DIR}',subdp)+d+'''
+    </main>
+  </body>
+</html>''')
+
+def write_options(outDir, db):
+  cur = db.cursor()
+  cur.execute('''
+    SELECT
+      setting.name AS name,
+      config_setting.config_name AS config_name,
+      config_setting.value AS value
+    FROM setting
+    LEFT OUTER JOIN config_setting ON (setting.name=config_setting.setting_name)
+    ORDER BY name ASC, config_name ASC
+  ''')
+
+  cur_name = None
+  d = ''
+
+  def close():
+    nonlocal cur_name, d
+    if cur_name is None:
+      return
+    d += '</table>'
+    write_xhtml(outDir, os.path.join('option', cur_name), d, title='Option '+cur_name, subd=1)
+    cur_name = None
+
+  def open(name):
+    nonlocal cur_name, d
+    cur_name = name
+    d = '''<h2>Option {0}</h2>
+    <table class="config-table">
+      <tr><th>Configuration Name</th><th>Value</th></tr>
+    '''.format(cgi.escape(name))
+
+  for name, config_name, value in cur:
+    if name != cur_name:
+      close()
+      open(name)
+
+    if value is None:
+      value = '(unset)'
+    d += '''<tr><td class="config-name"><a href="../configs/{0}">{0}</a></td><td>{1}</td></tr>'''.format(cgi.escape(config_name), cgi.escape(value))
+
+  close()
+
+
+def write_index(outDir, db):
+  d = '''
+  <p>This site provides reports about how the Linux kernel is configured by different Linux distributions.</p>
+  <p>For the source code, see <a href="https://github.com/hlandau/kconfigreport">github.com/hlandau/kconfigreport</a>.</p>
+  <p><a href="https://www.devever.net/~hl/">Other stuff by me.</a></p>
+  '''
+  write_xhtml(outDir, 'index', d)
+
+def write_configlist(outDir, db, reportName):
+  cur = db.cursor()
+  title = 'List of configurations used to generate this list'
+
+  d = '''<h2>{0}</h2>
+  <table class="config-table">
+    <tr><th>Configuration</th></tr>
+  '''.format(cgi.escape(title))
+
+  cur.execute('''SELECT name FROM config ORDER BY name ASC''')
+  for name, in cur:
+    d += '''<tr><td class="config-name"><a href="configs/{0}">{0}</a></td></tr>'''.format(cgi.escape(name))
+
+  d += '''</table>'''
+  write_xhtml(outDir, reportName, d, title=title)
+
+def write_list(outDir, db, reportName):
+  cur = db.cursor()
+
+  order = ''
+  title = ''
+  where = ''
+  hdr = '''<th>...percentage of which enable the option (<tt>y</tt>/<tt>m</tt>)</th>'''
+  tpl = '''<tr><td class="option-name"><a href="option/{0}.xhtml">{0}</a></td><td class="option-flags">{1}</td><td class="option-pct">{2}</td><td class="option-pct">{3}</td></tr>'''
+  if reportName == 'tristate_enabled':
+    order = 'pct_enabled_of_understood DESC, pct_understood DESC, name ASC'
+    title = 'Boolean and tristate options (sorted by enablement)'
+    where = 'WHERE setting.is_tristate=1'
+  elif reportName == 'tristate_understood':
+    order = 'pct_understood DESC, pct_enabled_of_understood DESC, name ASC'
+    title = 'Boolean and tristate options (sorted by understanding)'
+    where = 'WHERE setting.is_tristate=1'
+  elif reportName == 'value_name':
+    order = 'name ASC'
+    title = 'Non-boolean/tristate options (sorted by name)'
+    where = 'WHERE setting.is_tristate=0'
+    hdr   = ''
+    tpl   = '''<tr><td class="option-name"><a href="option/{0}.xhtml">{0}</a></td><td class="option-flags">{1}</td><td class="option-pct">{2}</td></tr>'''
+  elif reportName == 'options_understood':
+    order = 'pct_understood DESC, pct_enabled_of_understood DESC, name ASC'
+    title = 'All options (sorted by understanding)'
+  elif reportName == 'options_name':
+    order = 'name ASC'
+    title = 'All options (sorted by name)'
+
+  d = '''<h2>{0}</h2>
+  <table class="option-table">
+    <tr><th>Option name</th><th class="flags"><abbr title="v: Value option. Non-boolean/tristate option (string, integer, etc.)">Flags</abbr></th><th>Percentage of kernels understanding the option</th>{1}</tr>
+  '''.format(cgi.escape(title), hdr)
+
+  cur.execute('''
+  SELECT
+    s.name AS name,
+    s.is_tristate AS is_tristate,
+    CAST(s.num_understood AS float)/cnt.c            AS pct_understood,
+    CAST(s.num_enabled AS float)/s.num_understood    AS pct_enabled_of_understood
+  FROM
+    (
+      SELECT
+        setting.name AS name,
+        setting.is_tristate AS is_tristate,
+        SUM(config_setting.setting_name IS NOT NULL) AS num_understood,
+        SUM(config_setting.value = 'y' OR config_setting.value = 'm') AS num_enabled
+      FROM setting
+      LEFT OUTER JOIN config_setting ON (setting.name=config_setting.setting_name)
+      '''+where+'''
+      GROUP BY name
+    ) AS s,
+    (
+      SELECT COUNT(*) AS c FROM config
+    ) AS cnt
+  ORDER BY {0}
+    '''.format(order))
+  for name, is_tristate, num_understood, num_enabled_of_understood in cur:
+    flag = ''
+    if not is_tristate:
+      flag = 'v'
+
+    d += tpl.format(cgi.escape(name),
+        cgi.escape(flag),
+        cgi.escape(pct(num_understood or 0)),
+        cgi.escape(pct(num_enabled_of_understood or 0)))
+
+  d += '</table>'
+  write_xhtml(outDir, reportName, d, title=title)
+
+def run():
+  ap = argparse.ArgumentParser()
+  ap.add_argument('config-db')
+  ap.add_argument('output-dir')
+
+  args = vars(ap.parse_args())
+  configDB = args['config-db']
+  outDir = args['output-dir']
+
+  db = sqlite3.connect(configDB)
+  write_options(outDir, db)
+  write_list(outDir, db, 'tristate_enabled')
+  write_list(outDir, db, 'tristate_understood')
+  write_list(outDir, db, 'value_name')
+  write_list(outDir, db, 'options_understood')
+  write_list(outDir, db, 'options_name')
+  write_configlist(outDir, db, 'configlist')
+  write_index(outDir, db)
+
+  return 0
+
+if __name__ == '__main__':
+  sys.exit(run())
